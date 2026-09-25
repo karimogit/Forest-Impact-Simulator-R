@@ -8,7 +8,6 @@ output: html_document
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
-# Load required libraries
 library(tidyverse)
 library(ggplot2)
 library(jsonlite)
@@ -19,289 +18,549 @@ library(plotly)
 
 # Forest Impact Simulator
 
-This notebook simulates the environmental impact of forest planting or clear-cutting activities. It calculates carbon sequestration/loss, biodiversity impact, and other environmental metrics.
+R companion to the [Forest Impact Simulator web app](https://forest-impact-simulator.vercel.app/).
+Calculates carbon sequestration or loss, biodiversity, resilience, water retention, and air quality
+using the same growth curves and environmental modifiers as the TypeScript implementation.
 
-## 1. Data Input
+## 1. Constants (aligned with web app)
 
-### Option A: Upload CSV File
+```{r constants}
+# Planting-mode growth factors by simulation year (from src/utils/constants.ts)
+TREE_GROWTH_FACTORS <- list(
+  year_1 = 0.05,
+  year_2 = 0.15,
+  year_3 = 0.30,
+  year_4 = 0.50,
+  year_5 = 0.70,
+  year_6_to_10 = 0.80,
+  year_11_to_20 = 0.90,
+  year_20_plus = 1.00
+)
 
-If you have a CSV file with forest data, upload it here. The file should contain columns for land identification, area, tree types, and carbon data.
+# Clear-cutting age-based growth factors
+TREE_AGE_GROWTH_FACTORS <- list(
+  age_1 = 0.05,
+  age_2 = 0.15,
+  age_3 = 0.30,
+  age_4 = 0.50,
+  age_5 = 0.70,
+  age_6 = 0.85,
+  age_7_to_20 = 0.95,
+  age_21_to_50 = 0.90,
+  age_50_plus = 0.85
+)
+
+SOIL_CARBON_MODIFIER <- 0.1          # kg CO2/year per g/kg soil carbon
+PRECIP_TO_RESILIENCE <- 0.001
+BIODIVERSITY_TIME_BONUS <- 0.05
+RESILIENCE_TIME_BONUS <- 0.03
+WATER_ANNUAL_IMPROVEMENT <- 0.3
+WATER_ANNUAL_DEGRADATION <- 0.5
+AIR_ANNUAL_IMPROVEMENT <- 0.7
+AIR_ANNUAL_DEGRADATION <- 1.0
+MAX_WATER <- 95
+MAX_AIR <- 95
+MAX_AIR_DEGRADATION <- -80
+CAR_EMISSIONS_PER_YEAR <- 4600       # kg CO2
+FLIGHT_NY_LONDON <- 986              # kg CO2
+HOUSEHOLD_ELECTRICITY_PER_YEAR <- 7500
+
+get_planting_growth_factor <- function(year) {
+  if (year <= 1) return(TREE_GROWTH_FACTORS$year_1)
+  if (year == 2) return(TREE_GROWTH_FACTORS$year_2)
+  if (year == 3) return(TREE_GROWTH_FACTORS$year_3)
+  if (year == 4) return(TREE_GROWTH_FACTORS$year_4)
+  if (year == 5) return(TREE_GROWTH_FACTORS$year_5)
+  if (year <= 10) return(TREE_GROWTH_FACTORS$year_6_to_10)
+  if (year <= 20) return(TREE_GROWTH_FACTORS$year_11_to_20)
+  TREE_GROWTH_FACTORS$year_20_plus
+}
+
+get_age_growth_factor <- function(age) {
+  if (age <= 1) return(TREE_AGE_GROWTH_FACTORS$age_1)
+  if (age <= 2) return(TREE_AGE_GROWTH_FACTORS$age_2)
+  if (age <= 3) return(TREE_AGE_GROWTH_FACTORS$age_3)
+  if (age <= 4) return(TREE_AGE_GROWTH_FACTORS$age_4)
+  if (age <= 5) return(TREE_AGE_GROWTH_FACTORS$age_5)
+  if (age <= 6) return(TREE_AGE_GROWTH_FACTORS$age_6)
+  if (age <= 20) return(TREE_AGE_GROWTH_FACTORS$age_7_to_20)
+  if (age <= 50) return(TREE_AGE_GROWTH_FACTORS$age_21_to_50)
+  TREE_AGE_GROWTH_FACTORS$age_50_plus
+}
+
+# Cumulative carbon for planting (mature annual rate × growth curve)
+calculate_cumulative_carbon <- function(mature_annual_rate, years) {
+  total <- 0
+  for (year in seq_len(years)) {
+    total <- total + mature_annual_rate * get_planting_growth_factor(year)
+  }
+  total
+}
+
+# Clear-cutting: lifetime stored carbon + lost future sequestration
+calculate_clear_cutting_carbon <- function(mature_annual_rate, tree_age, simulation_years) {
+  immediate <- 0
+  for (year in seq_len(tree_age)) {
+    immediate <- immediate + mature_annual_rate * get_age_growth_factor(year)
+  }
+  lost_future <- 0
+  for (year in seq_len(simulation_years)) {
+    lost_future <- lost_future + mature_annual_rate * get_age_growth_factor(tree_age + year)
+  }
+  list(immediate = immediate, lost_future = lost_future, total = immediate + lost_future)
+}
+
+split_semicolon <- function(value) {
+  if (length(value) == 0 || is.null(value) || (length(value) == 1 && is.na(value))) {
+    return(character(0))
+  }
+  text <- as.character(value)
+  if (!nzchar(text)) return(character(0))
+  trimws(unlist(strsplit(text, ";", fixed = TRUE)))
+}
+```
+
+## 2. Data Input
+
+### Supported formats
+
+1. **Web app CSV** (recommended) — single header + one data row from
+   [forest-impact-simulator.vercel.app](https://forest-impact-simulator.vercel.app/) export
+2. **Plot CSV** — one row per land plot (`land_id`, `area_ha`, `tree_type`, `carbon_per_tree`, …)
+3. **Manual input** — edit the data frames below
 
 ```{r data-input, echo=FALSE, message=FALSE}
-# Function to detect CSV format
 detect_csv_format <- function(file_path) {
-  lines <- readLines(file_path, n = 10)
-  if (any(grepl("^METADATA$", lines))) {
-    return("structured")
-  } else {
-    return("standard")
+  headers <- tolower(names(read.csv(file_path, nrows = 0, check.names = FALSE)))
+  if ("timestamp" %in% headers && "tree_names" %in% headers) {
+    return("webapp")
   }
+  if ("land_id" %in% headers || "plot_id" %in% headers) {
+    return("plot")
+  }
+  "unknown"
 }
 
-# Function to parse structured CSV
-parse_structured_csv <- function(file_path) {
-  lines <- readLines(file_path)
-  
-  # Find section boundaries
-  metadata_start <- which(lines == "METADATA") + 1
-  trees_start <- which(lines == "SELECTED TREES") + 1
-  env_start <- which(lines == "ENVIRONMENTAL DATA") + 1
-  impact_start <- which(lines == "IMPACT RESULTS") + 1
-  planting_start <- which(lines == "PLANTING DATA") + 1
-  
-  # Extract metadata
-  metadata_lines <- lines[metadata_start:(trees_start-2)]
-  metadata <- data.frame(
-    Parameter = sapply(strsplit(metadata_lines, ","), `[`, 1),
-    Value = sapply(strsplit(metadata_lines, ","), function(x) paste(x[-1], collapse = ","))
-  )
-  
-  # Extract tree data
-  tree_lines <- lines[trees_start:(env_start-2)]
+parse_webapp_csv <- function(file_path) {
+  row <- read.csv(file_path, stringsAsFactors = FALSE, check.names = FALSE)[1, , drop = FALSE]
+
+  tree_names <- split_semicolon(row$tree_names)
+  tree_scientific <- split_semicolon(row$tree_scientific_names)
+  tree_rates <- as.numeric(split_semicolon(row$tree_carbon_rates_kg_co2_year))
+  tree_pcts <- as.numeric(split_semicolon(row$tree_percentages))
+
+  n_trees <- max(length(tree_names), 1)
+  if (length(tree_scientific) < n_trees) tree_scientific <- rep(NA_character_, n_trees)
+  if (length(tree_rates) < n_trees) tree_rates <- rep(NA_real_, n_trees)
+  # Web exports sometimes store 0 for a single species; treat missing/zero as equal split
+  if (length(tree_pcts) < n_trees || all(is.na(tree_pcts)) || sum(tree_pcts, na.rm = TRUE) <= 0) {
+    tree_pcts <- rep(100 / n_trees, n_trees)
+  }
+
   tree_data <- data.frame(
-    Name = sapply(strsplit(tree_lines[-1], ","), `[`, 1),
-    Scientific_Name = sapply(strsplit(tree_lines[-1], ","), `[`, 2),
-    Carbon_Sequestration = as.numeric(sapply(strsplit(tree_lines[-1], ","), `[`, 3)),
-    Percentage = sapply(strsplit(tree_lines[-1], ","), `[`, 4)
+    name = tree_names,
+    scientific_name = tree_scientific[seq_len(n_trees)],
+    carbon_per_tree = tree_rates[seq_len(n_trees)],
+    percentage = tree_pcts[seq_len(n_trees)],
+    stringsAsFactors = FALSE
   )
-  
-  # Extract environmental data
-  env_lines <- lines[env_start:(impact_start-2)]
-  env_data <- data.frame(
-    Metric = sapply(strsplit(env_lines[-1], ","), `[`, 1),
-    Value = sapply(strsplit(env_lines[-1], ","), function(x) paste(x[-1], collapse = ","))
+
+  list(
+    format = "webapp",
+    row = row,
+    tree_data = tree_data,
+    simulation_years = as.numeric(row$simulation_years),
+    latitude = as.numeric(row$latitude),
+    longitude = as.numeric(row$longitude),
+    area_ha = as.numeric(row$area_hectares),
+    total_trees = as.numeric(row$total_trees),
+    spacing = as.numeric(row$spacing_meters),
+    density = as.numeric(row$density_trees_hectare),
+    soil_carbon = suppressWarnings(as.numeric(row$soil_carbon_g_kg)),
+    soil_ph = suppressWarnings(as.numeric(row$soil_ph)),
+    temperature = suppressWarnings(as.numeric(row$temperature_c)),
+    precipitation = suppressWarnings(as.numeric(row$precipitation_mm)),
+    # Pre-computed impact results from the web app (use when present)
+    annual_carbon = suppressWarnings(as.numeric(row$annual_carbon_sequestration_kg_co2_year)),
+    total_carbon = suppressWarnings(as.numeric(row$total_carbon_kg_co2)),
+    biodiversity = suppressWarnings(as.numeric(row$biodiversity_impact)),
+    resilience = suppressWarnings(as.numeric(row$forest_resilience)),
+    water_retention = suppressWarnings(as.numeric(row$water_retention_percent)),
+    air_quality = suppressWarnings(as.numeric(row$air_quality_improvement_percent)),
+    average_biodiversity = suppressWarnings(as.numeric(row$average_biodiversity)),
+    average_resilience = suppressWarnings(as.numeric(row$average_resilience))
   )
-  
-  # Extract planting data
-  planting_lines <- lines[planting_start:length(lines)]
-  planting_data <- data.frame(
-    Metric = sapply(strsplit(planting_lines[-1], ","), `[`, 1),
-    Value = sapply(strsplit(planting_lines[-1], ","), function(x) paste(x[-1], collapse = ","))
-  )
-  
-  return(list(metadata = metadata, tree_data = tree_data, env_data = env_data, planting_data = planting_data))
 }
 
-# Check for CSV files
-structured_file <- "sample-forest-planting-data.csv"
-standard_file <- "sample-forest-data-standard.csv"
+parse_plot_csv <- function(file_path) {
+  df <- read.csv(file_path, stringsAsFactors = FALSE, check.names = FALSE)
+  if (!"land_id" %in% names(df) && "plot_id" %in% names(df)) {
+    df$land_id <- df$plot_id
+  }
+  if (!"carbon_per_tree" %in% names(df) && "carbon_per_ha" %in% names(df)) {
+    # Legacy column name: treat as per-tree mature rate (kg CO2/year/tree)
+    df$carbon_per_tree <- df$carbon_per_ha
+  }
+  list(format = "plot", land_data = df)
+}
+
+webapp_file <- "sample-forest-planting-data.csv"
+plot_file <- "sample-forest-plot-data.csv"
 has_csv_data <- FALSE
 csv_format <- "none"
+parsed <- NULL
 
-if (file.exists(structured_file)) {
-  cat("**Structured CSV file found!** Loading data...\n\n")
-  csv_data <- parse_structured_csv(structured_file)
+if (file.exists(webapp_file)) {
+  fmt <- detect_csv_format(webapp_file)
+  if (fmt == "webapp") {
+    cat("**Web app CSV found!** Loading comprehensive export...\n\n")
+    parsed <- parse_webapp_csv(webapp_file)
+    has_csv_data <- TRUE
+    csv_format <- "webapp"
+    cat("**Trees:**\n")
+    print(parsed$tree_data)
+    cat("\n**Key fields:**\n")
+    cat(sprintf("- Years: %s | Area: %s ha | Trees: %s\n",
+                parsed$simulation_years, parsed$area_ha, parsed$total_trees))
+    cat(sprintf("- Location: %s, %s\n", parsed$latitude, parsed$longitude))
+    cat(sprintf("- Pre-computed total carbon: %s kg CO2\n",
+                format(parsed$total_carbon, big.mark = ",")))
+  } else if (fmt == "plot") {
+    cat("**Plot CSV found** in sample-forest-planting-data.csv\n\n")
+    parsed <- parse_plot_csv(webapp_file)
+    has_csv_data <- TRUE
+    csv_format <- "plot"
+    print(parsed$land_data)
+  } else {
+    cat("**Unknown CSV format** in sample-forest-planting-data.csv. Using manual input.\n\n")
+  }
+} else if (file.exists(plot_file)) {
+  cat("**Plot CSV found!** Loading plot-level data...\n\n")
+  parsed <- parse_plot_csv(plot_file)
   has_csv_data <- TRUE
-  csv_format <- "structured"
-  
-  # Display loaded data
-  cat("**Metadata:**\n")
-  print(csv_data$metadata)
-  
-  cat("\n**Tree Data:**\n")
-  print(csv_data$tree_data)
-  
-  cat("\n**Environmental Data:**\n")
-  print(csv_data$env_data)
-  
-  cat("\n**Planting Data:**\n")
-  print(csv_data$planting_data)
-  
-} else if (file.exists(standard_file)) {
-  cat("**Standard CSV file found!** Loading data...\n\n")
-  standard_data <- read.csv(standard_file, stringsAsFactors = FALSE)
-  has_csv_data <- TRUE
-  csv_format <- "standard"
-  
-  # Display loaded data
-  cat("**Standard CSV Data:**\n")
-  print(standard_data)
-  
+  csv_format <- "plot"
+  print(parsed$land_data)
 } else {
   cat("**No CSV data files found.** Using manual input below.\n\n")
-  has_csv_data <- FALSE
 }
 ```
 
 ### Option B: Manual Data Input
 
-If you don't have a CSV file, you can manually input your forest data here:
+Used when no CSV is present, or as a template for custom runs.
 
 ```{r manual-input, echo=FALSE}
-# Manual data input section
-cat("## Manual Data Input\n\n")
-cat("Please modify the following data frames with your forest data:\n\n")
-
-# Create sample data structure for manual input
-land_data <- data.frame(
+# Manual plot-level input (carbon_per_tree = mature kg CO2/year/tree)
+manual_land_data <- data.frame(
   land_id = c("Plot_001", "Plot_002", "Plot_003"),
   area_ha = c(0.1, 0.15, 0.2),
   tree_type = c("Oak", "Pine", "Mixed"),
-  carbon_per_ha = c(110, 125, 118),
+  carbon_per_tree = c(22, 18.5, 20),
+  trees_per_ha = c(625, 625, 625),
   biodiversity_score = c(4.5, 4.2, 4.8),
   resilience_score = c(4.3, 4.0, 4.6),
   stringsAsFactors = FALSE
 )
 
-cat("**Land Plot Data:**\n")
-print(land_data)
-
-# Location and simulation parameters
-location_data <- data.frame(
+manual_location <- data.frame(
   latitude = 50.56956736416948,
   longitude = 28.159344338632376,
-  simulation_years = 50
+  simulation_years = 50,
+  tree_age = 20   # used only for clear-cutting
 )
 
-cat("\n**Location and Simulation Parameters:**\n")
-print(location_data)
+manual_env <- data.frame(
+  soil_carbon = NA_real_,
+  soil_ph = NA_real_,
+  temperature = 15,
+  precipitation = NA_real_
+)
+
+if (!has_csv_data) {
+  cat("**Manual Land Plot Data:**\n")
+  print(manual_land_data)
+  cat("\n**Location / Years:**\n")
+  print(manual_location)
+}
 ```
 
-## 2. Mode Selection
-
-Select the simulation mode:
+## 3. Mode Selection
 
 ```{r mode-selection, echo=FALSE}
-# Mode selection
-mode <- "planting"  # Change to "clear-cutting" for deforestation simulation
+mode <- "planting"   # or "clear-cutting"
+tree_age <- 20       # average age of existing trees (clear-cutting only)
 
 cat(paste("**Selected Mode:**", toupper(mode), "\n\n"))
-
 if (mode == "planting") {
-  cat("🌱 **Planting Mode**: Calculating positive carbon sequestration from new forest growth\n")
+  cat("Planting mode: cumulative carbon with realistic growth curve.\n")
 } else {
-  cat("🌲 **Clear-cutting Mode**: Calculating carbon loss from forest removal\n")
+  cat(sprintf(
+    "Clear-cutting mode: immediate release (age %s) + lost future sequestration.\n",
+    tree_age
+  ))
 }
 ```
 
-## 3. Data Processing and Calculations
+## 4. Calculations
 
 ```{r calculations, echo=TRUE}
-# Process the data based on format and mode
-if (has_csv_data && csv_format == "structured") {
-  # Use structured data from CSV file
-  current_data <- csv_data$tree_data
-  area_ha <- as.numeric(csv_data$planting_data$Value[csv_data$planting_data$Metric == "Area (hectares)"])
-  simulation_years <- as.numeric(csv_data$metadata$Value[csv_data$metadata$Parameter == "Simulation Years"])
-  latitude <- as.numeric(csv_data$metadata$Value[csv_data$metadata$Parameter == "Latitude"])
-  longitude <- as.numeric(csv_data$metadata$Value[csv_data$metadata$Parameter == "Longitude"])
-  
-  # Extract environmental values
-  soil_carbon <- as.numeric(csv_data$env_data$Value[csv_data$env_data$Metric == "Soil Carbon (g/kg)"])
-  soil_ph <- as.numeric(csv_data$env_data$Value[csv_data$env_data$Metric == "Soil pH"])
-  temperature <- as.numeric(csv_data$env_data$Value[csv_data$env_data$Metric == "Temperature (°C)"])
-  precipitation <- as.numeric(csv_data$env_data$Value[csv_data$env_data$Metric == "Precipitation (mm)"])
-  
-  # Create land data from existing structure
+if (has_csv_data && csv_format == "webapp") {
+  simulation_years <- parsed$simulation_years
+  latitude <- parsed$latitude
+  longitude <- parsed$longitude
+  area_ha <- parsed$area_ha
+  total_trees <- parsed$total_trees
+  spacing <- ifelse(is.na(parsed$spacing), 4, parsed$spacing)
+  density <- ifelse(is.na(parsed$density), 625, parsed$density)
+
+  soil_carbon <- parsed$soil_carbon
+  soil_ph <- parsed$soil_ph
+  temperature <- parsed$temperature
+  precipitation <- parsed$precipitation
+
+  # Weighted mature rate per tree (kg CO2/year)
+  weights <- parsed$tree_data$percentage / 100
+  if (any(is.na(weights)) || sum(weights) == 0) {
+    weights <- rep(1 / nrow(parsed$tree_data), nrow(parsed$tree_data))
+  }
+  mature_rate_per_tree <- sum(parsed$tree_data$carbon_per_tree * weights, na.rm = TRUE)
+
+  # Soil carbon modifier (matches web app)
+  if (!is.na(soil_carbon)) {
+    mature_rate_per_tree <- mature_rate_per_tree + soil_carbon * SOIL_CARBON_MODIFIER
+  }
+
+  mature_annual_total <- mature_rate_per_tree * total_trees
+
+  if (mode == "planting") {
+    recalculated_total <- calculate_cumulative_carbon(mature_annual_total, simulation_years)
+    immediate_release <- NA_real_
+    lost_future <- NA_real_
+  } else {
+    cc <- calculate_clear_cutting_carbon(mature_annual_total, tree_age, simulation_years)
+    recalculated_total <- -cc$total
+    immediate_release <- cc$immediate
+    lost_future <- cc$lost_future
+  }
+
+  # Prefer web-app precomputed totals for planting when available;
+  # always recalculate for clear-cutting (export is planting-oriented).
+  if (mode == "planting" && !is.na(parsed$total_carbon)) {
+    total_carbon <- parsed$total_carbon
+    annual_carbon <- ifelse(
+      !is.na(parsed$annual_carbon),
+      parsed$annual_carbon,
+      total_carbon / simulation_years
+    )
+    used_source <- "web app export"
+  } else {
+    total_carbon <- recalculated_total
+    annual_carbon <- total_carbon / simulation_years
+    used_source <- "recalculated growth curve"
+  }
+
+  biodiversity <- ifelse(!is.na(parsed$biodiversity), parsed$biodiversity, 4.5)
+  resilience <- ifelse(!is.na(parsed$resilience), parsed$resilience, 4.5)
+  if (!is.na(precipitation) && is.na(parsed$resilience)) {
+    resilience <- min(5, resilience + precipitation * PRECIP_TO_RESILIENCE)
+  }
+  water_retention <- ifelse(!is.na(parsed$water_retention), parsed$water_retention, 85)
+  air_quality <- ifelse(!is.na(parsed$air_quality), parsed$air_quality, 80)
+  average_biodiversity <- ifelse(
+    !is.na(parsed$average_biodiversity), parsed$average_biodiversity, biodiversity
+  )
+  average_resilience <- ifelse(
+    !is.na(parsed$average_resilience), parsed$average_resilience, resilience
+  )
+
   land_data <- data.frame(
-    land_id = paste0("Plot_", 1:nrow(current_data)),
-    area_ha = area_ha / nrow(current_data),
-    tree_type = current_data$Name,
-    carbon_per_ha = current_data$Carbon_Sequestration,
-    biodiversity_score = rep(4.5, nrow(current_data)),
-    resilience_score = rep(4.5, nrow(current_data)),
+    land_id = paste0("Species_", seq_len(nrow(parsed$tree_data))),
+    tree_type = parsed$tree_data$name,
+    scientific_name = parsed$tree_data$scientific_name,
+    percentage = parsed$tree_data$percentage,
+    carbon_per_tree = parsed$tree_data$carbon_per_tree,
+    trees = round(total_trees * weights),
+    area_ha = area_ha * weights,
     stringsAsFactors = FALSE
   )
-  
-  location_data <- data.frame(
-    latitude = latitude,
-    longitude = longitude,
-    simulation_years = simulation_years
-  )
-  
-  # Create structured environmental data
-  env_data_structured <- data.frame(
-    soil_carbon = ifelse(is.na(soil_carbon), NA, soil_carbon),
-    soil_ph = ifelse(is.na(soil_ph), NA, soil_ph),
-    temperature = ifelse(is.na(temperature), 22.4, temperature),
-    precipitation = ifelse(is.na(precipitation), NA, precipitation)
-  )
-  
-} else if (has_csv_data && csv_format == "standard") {
-  # Use standard CSV data
-  land_data <- standard_data
-  
-  # Extract location and simulation data from first row
-  location_data <- data.frame(
-    latitude = land_data$latitude[1],
-    longitude = land_data$longitude[1],
-    simulation_years = land_data$simulation_years[1]
-  )
-  
-  # Create environmental data from first row
-  env_data_structured <- data.frame(
-    soil_carbon = land_data$soil_carbon[1],
-    soil_ph = land_data$soil_ph[1],
-    temperature = land_data$temperature[1],
-    precipitation = land_data$precipitation[1]
-  )
-  
-  simulation_years <- location_data$simulation_years
-  
+  land_data$co2_impact_kg <- if (mode == "planting") {
+    vapply(seq_len(nrow(land_data)), function(i) {
+      calculate_cumulative_carbon(
+        land_data$carbon_per_tree[i] * land_data$trees[i],
+        simulation_years
+      )
+    }, numeric(1))
+  } else {
+    vapply(seq_len(nrow(land_data)), function(i) {
+      -calculate_clear_cutting_carbon(
+        land_data$carbon_per_tree[i] * land_data$trees[i],
+        tree_age,
+        simulation_years
+      )$total
+    }, numeric(1))
+  }
+
 } else {
-  # Use manual data
-  simulation_years <- location_data$simulation_years
-  env_data_structured <- data.frame(
-    soil_carbon = NA,
-    soil_ph = NA,
-    temperature = 22.4,
-    precipitation = NA
-  )
+  # Plot CSV or manual input
+  if (has_csv_data && csv_format == "plot") {
+    land_data <- parsed$land_data
+    simulation_years <- if ("simulation_years" %in% names(land_data)) {
+      land_data$simulation_years[1]
+    } else {
+      manual_location$simulation_years
+    }
+    latitude <- if ("latitude" %in% names(land_data)) land_data$latitude[1] else manual_location$latitude
+    longitude <- if ("longitude" %in% names(land_data)) land_data$longitude[1] else manual_location$longitude
+    soil_carbon <- if ("soil_carbon" %in% names(land_data)) land_data$soil_carbon[1] else NA_real_
+    soil_ph <- if ("soil_ph" %in% names(land_data)) land_data$soil_ph[1] else NA_real_
+    temperature <- if ("temperature" %in% names(land_data)) land_data$temperature[1] else 15
+    precipitation <- if ("precipitation" %in% names(land_data)) land_data$precipitation[1] else NA_real_
+  } else {
+    land_data <- manual_land_data
+    simulation_years <- manual_location$simulation_years
+    latitude <- manual_location$latitude
+    longitude <- manual_location$longitude
+    tree_age <- manual_location$tree_age
+    soil_carbon <- manual_env$soil_carbon
+    soil_ph <- manual_env$soil_ph
+    temperature <- manual_env$temperature
+    precipitation <- manual_env$precipitation
+  }
+
+  if (!"trees_per_ha" %in% names(land_data)) land_data$trees_per_ha <- 625
+  if (!"carbon_per_tree" %in% names(land_data)) {
+    stop("Plot data needs carbon_per_tree (mature kg CO2/year/tree).")
+  }
+  land_data$trees <- round(land_data$area_ha * land_data$trees_per_ha)
+
+  land_data$co2_impact_kg <- if (mode == "planting") {
+    vapply(seq_len(nrow(land_data)), function(i) {
+      rate <- land_data$carbon_per_tree[i]
+      if (!is.na(soil_carbon)) rate <- rate + soil_carbon * SOIL_CARBON_MODIFIER
+      calculate_cumulative_carbon(rate * land_data$trees[i], simulation_years)
+    }, numeric(1))
+  } else {
+    vapply(seq_len(nrow(land_data)), function(i) {
+      rate <- land_data$carbon_per_tree[i]
+      if (!is.na(soil_carbon)) rate <- rate + soil_carbon * SOIL_CARBON_MODIFIER
+      -calculate_clear_cutting_carbon(
+        rate * land_data$trees[i], tree_age, simulation_years
+      )$total
+    }, numeric(1))
+  }
+
+  total_carbon <- sum(land_data$co2_impact_kg)
+  annual_carbon <- total_carbon / simulation_years
+  recalculated_total <- total_carbon
+  immediate_release <- NA_real_
+  lost_future <- NA_real_
+  used_source <- "recalculated growth curve"
+
+  area_ha <- sum(land_data$area_ha)
+  total_trees <- sum(land_data$trees)
+  spacing <- 4
+  density <- 625
+
+  bio_col <- if ("biodiversity_score" %in% names(land_data)) {
+    land_data$biodiversity_score
+  } else {
+    rep(4.0, nrow(land_data))
+  }
+  res_col <- if ("resilience_score" %in% names(land_data)) {
+    land_data$resilience_score
+  } else {
+    rep(4.0, nrow(land_data))
+  }
+
+  time_sign <- if (mode == "planting") 1 else -1
+  biodiversity <- min(5, max(0, mean(bio_col) + time_sign * simulation_years * BIODIVERSITY_TIME_BONUS))
+  resilience <- mean(res_col)
+  if (!is.na(precipitation)) {
+    resilience <- resilience + precipitation * PRECIP_TO_RESILIENCE
+  }
+  resilience <- min(5, max(0, resilience + time_sign * simulation_years * RESILIENCE_TIME_BONUS))
+
+  abs_lat <- abs(latitude)
+  water_base <- if (abs_lat < 30) 85 else if (abs_lat < 60) 75 else 70
+  if (mode == "planting") {
+    water_retention <- min(MAX_WATER, water_base + simulation_years * WATER_ANNUAL_IMPROVEMENT)
+    air_base <- if (abs_lat < 30) 70 else if (abs_lat < 60) 60 else 50
+    air_quality <- min(MAX_AIR, air_base + simulation_years * AIR_ANNUAL_IMPROVEMENT)
+  } else {
+    water_retention <- max(0, water_base - simulation_years * WATER_ANNUAL_DEGRADATION)
+    immediate_air <- min(30, log10(max(total_trees, 10)) * 5)
+    air_quality <- max(MAX_AIR_DEGRADATION, -(immediate_air + simulation_years * AIR_ANNUAL_DEGRADATION))
+  }
+
+  average_biodiversity <- biodiversity
+  average_resilience <- resilience
 }
 
-# Calculate CO2 impact based on mode
-if (mode == "planting") {
-  land_data$co2_impact_tons <- land_data$area_ha * land_data$carbon_per_ha * simulation_years
-  mode_multiplier <- 1
-  impact_type <- "Carbon Sequestration"
-} else {
-  land_data$co2_impact_tons <- -(land_data$area_ha * land_data$carbon_per_ha * simulation_years)
-  mode_multiplier <- -1
-  impact_type <- "Carbon Loss"
-}
+impact_type <- if (mode == "planting") "Carbon Sequestration" else "Carbon Emissions"
+comparisons <- list(
+  car_years = abs(total_carbon) / CAR_EMISSIONS_PER_YEAR,
+  flights = abs(total_carbon) / FLIGHT_NY_LONDON,
+  household_years = abs(total_carbon) / HOUSEHOLD_ELECTRICITY_PER_YEAR
+)
 
-# Calculate totals and averages
-total_carbon <- sum(land_data$co2_impact_tons)
-average_biodiversity <- mean(land_data$biodiversity_score)
-average_resilience <- mean(land_data$resilience_score)
-total_area <- sum(land_data$area_ha)
-total_trees <- round(total_area * 625)  # Assuming 625 trees per hectare
-
-# Display results
 cat("## Calculation Results\n\n")
-cat("**Land Plot Calculations:**\n")
+cat(sprintf("**Source:** %s\n\n", used_source))
+cat("**Plot / species breakdown:**\n")
 print(land_data)
 
-cat(paste("\n**Summary Statistics:**\n"))
-cat(paste("- Total", impact_type, ":", round(total_carbon, 2), "kg CO2\n"))
-cat(paste("- Total Area:", round(total_area, 3), "hectares\n"))
-cat(paste("- Average Biodiversity Score:", round(average_biodiversity, 2), "/5\n"))
-cat(paste("- Average Resilience Score:", round(average_resilience, 2), "/5\n"))
-cat(paste("- Total Trees:", total_trees, "\n"))
+cat("\n**Summary:**\n")
+cat(sprintf("- Total %s: %s kg CO2\n", impact_type, format(round(total_carbon, 1), big.mark = ",")))
+cat(sprintf("- Period-average annual: %s kg CO2/year\n", format(round(annual_carbon, 1), big.mark = ",")))
+if (mode == "clear-cutting" && !is.na(immediate_release)) {
+  cat(sprintf("- Immediate release: %s kg CO2\n", format(round(immediate_release, 1), big.mark = ",")))
+  cat(sprintf("- Lost future sequestration: %s kg CO2\n", format(round(lost_future, 1), big.mark = ",")))
+}
+cat(sprintf("- Area: %s ha | Trees: %s | Years: %s\n",
+            round(area_ha, 2), format(total_trees, big.mark = ","), simulation_years))
+cat(sprintf("- Biodiversity: %.1f/5 | Resilience: %.1f/5\n", biodiversity, resilience))
+cat(sprintf("- Water retention: %.0f%% | Air quality: %.0f%%\n", water_retention, air_quality))
+cat("\n**Real-world comparisons (absolute CO2):**\n")
+cat(sprintf("- ≈ %.0f years of average car emissions\n", comparisons$car_years))
+cat(sprintf("- ≈ %.0f NY–London round-trip flights\n", comparisons$flights))
+cat(sprintf("- ≈ %.0f years of US household electricity\n", comparisons$household_years))
+
+if (has_csv_data && csv_format == "webapp" && mode == "planting") {
+  cat(sprintf(
+    "\n**Growth-curve recalculation check:** %s kg CO2 (web app export: %s)\n",
+    format(round(recalculated_total, 1), big.mark = ","),
+    format(round(parsed$total_carbon, 1), big.mark = ",")
+  ))
+}
 ```
 
-## 4. Data Visualization
+## 5. Visualizations
 
-### CO2 Impact by Land Plot
+### CO2 Impact by Species / Plot
 
 ```{r co2-bar-chart, fig.width=10, fig.height=6}
-# Create bar chart for CO2 impact per land plot
-co2_plot <- ggplot(land_data, aes(x = land_id, y = co2_impact_tons, fill = tree_type)) +
-  geom_bar(stat = "identity", alpha = 0.8) +
-  geom_text(aes(label = paste(round(co2_impact_tons, 1), "kg CO2")), 
-            vjust = -0.5, size = 3.5) +
+y_col <- if ("co2_impact_kg" %in% names(land_data)) "co2_impact_kg" else "co2_impact_tons"
+x_col <- if ("tree_type" %in% names(land_data)) "tree_type" else "land_id"
+
+plot_df <- land_data
+plot_df$label_x <- plot_df[[x_col]]
+plot_df$co2 <- plot_df[[y_col]]
+
+co2_plot <- ggplot(plot_df, aes(x = label_x, y = co2, fill = tree_type)) +
+  geom_bar(stat = "identity", alpha = 0.85) +
+  geom_text(aes(label = paste(format(round(co2, 0), big.mark = ","), "kg")),
+            vjust = -0.4, size = 3.2) +
   labs(
-    title = paste("CO2 Impact by Land Plot -", impact_type),
-    subtitle = paste("Total:", round(total_carbon, 2), "kg CO2 over", simulation_years, "years"),
-    x = "Land Plot ID",
-    y = paste("CO2", ifelse(mode == "planting", "Sequestration", "Loss"), "(kg)"),
+    title = paste("CO2 Impact —", impact_type),
+    subtitle = paste("Total:", format(round(total_carbon, 1), big.mark = ","),
+                     "kg CO2 over", simulation_years, "years"),
+    x = if (x_col == "tree_type") "Tree Type" else "Land Plot",
+    y = "CO2 (kg)",
     fill = "Tree Type"
   ) +
   theme_minimal() +
   theme(
     plot.title = element_text(size = 16, face = "bold"),
-    plot.subtitle = element_text(size = 12),
-    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.x = element_text(angle = 30, hjust = 1),
     legend.position = "bottom"
   ) +
   scale_fill_brewer(type = "qual", palette = "Set2")
@@ -309,100 +568,89 @@ co2_plot <- ggplot(land_data, aes(x = land_id, y = co2_impact_tons, fill = tree_
 print(co2_plot)
 ```
 
-### Environmental Metrics Comparison
+### Environmental Metrics
 
-```{r metrics-comparison, fig.width=10, fig.height=6}
-# Create comparison chart for environmental metrics
-metrics_data <- land_data %>%
-  select(land_id, biodiversity_score, resilience_score) %>%
-  pivot_longer(cols = c(biodiversity_score, resilience_score), 
-               names_to = "metric", values_to = "score") %>%
-  mutate(metric = case_when(
-    metric == "biodiversity_score" ~ "Biodiversity Impact",
-    metric == "resilience_score" ~ "Forest Resilience"
-  ))
+```{r metrics-comparison, fig.width=9, fig.height=5}
+metrics_df <- data.frame(
+  metric = c("Biodiversity", "Resilience", "Water retention /20", "Air quality /20"),
+  score = c(
+    biodiversity,
+    resilience,
+    water_retention / 20,
+    abs(air_quality) / 20
+  )
+)
 
-metrics_plot <- ggplot(metrics_data, aes(x = land_id, y = score, fill = metric)) +
-  geom_bar(stat = "identity", position = "dodge", alpha = 0.8) +
-  geom_text(aes(label = paste(round(score, 1), "/5")), 
-            position = position_dodge(width = 0.9), vjust = -0.5, size = 3.5) +
+metrics_plot <- ggplot(metrics_df, aes(x = metric, y = score, fill = metric)) +
+  geom_bar(stat = "identity", alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = round(score, 2)), vjust = -0.4, size = 3.5) +
   labs(
-    title = "Environmental Metrics by Land Plot",
-    x = "Land Plot ID",
-    y = "Score (out of 5)",
-    fill = "Metric"
+    title = "Environmental Metrics",
+    subtitle = "Biodiversity & resilience on 0–5 scale; water/air scaled /20 for comparison",
+    x = NULL,
+    y = "Score"
   ) +
   theme_minimal() +
-  theme(
-    plot.title = element_text(size = 16, face = "bold"),
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    legend.position = "bottom"
-  ) +
-  scale_fill_brewer(type = "qual", palette = "Set1") +
-  ylim(0, 5)
+  theme(plot.title = element_text(size = 16, face = "bold")) +
+  ylim(0, 5.5) +
+  scale_fill_brewer(type = "qual", palette = "Set1")
 
 print(metrics_plot)
 ```
 
-### Area Distribution
+### Yearly Carbon Accumulation (growth curve)
 
-```{r area-pie-chart, fig.width=8, fig.height=8}
-# Create pie chart for area distribution
-area_plot <- ggplot(land_data, aes(x = "", y = area_ha, fill = tree_type)) +
-  geom_bar(stat = "identity", width = 1) +
-  coord_polar("y", start = 0) +
-  geom_text(aes(label = paste(tree_type, "\n", round(area_ha, 3), "ha")), 
-            position = position_stack(vjust = 0.5), size = 4) +
-  labs(
-    title = "Area Distribution by Tree Type",
-    fill = "Tree Type"
-  ) +
-  theme_void() +
-  theme(
-    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
-    legend.position = "none"
-  ) +
-  scale_fill_brewer(type = "qual", palette = "Set2")
+```{r yearly-projection, fig.width=12, fig.height=6}
+if (mode == "planting" && simulation_years > 1) {
+  # Use mature annual rate implied by period-average and growth factors
+  mature_annual <- if (has_csv_data && csv_format == "webapp") {
+    mature_annual_total
+  } else {
+    # Back out approximate mature rate from total trees × mean per-tree rate
+    mean(land_data$carbon_per_tree, na.rm = TRUE) * total_trees
+  }
 
-print(area_plot)
+  yearly <- data.frame(year = seq_len(simulation_years))
+  yearly$annual <- sapply(yearly$year, function(y) {
+    mature_annual * get_planting_growth_factor(y)
+  })
+  yearly$cumulative <- cumsum(yearly$annual)
+
+  yearly_plot <- ggplot(yearly, aes(x = year, y = cumulative)) +
+    geom_line(color = "#2E8B57", linewidth = 1.2) +
+    geom_area(fill = "#2E8B57", alpha = 0.2) +
+    labs(
+      title = "Cumulative Carbon Sequestration (Growth Curve)",
+      subtitle = "Year 1 ≈ 5% of mature rate → Year 20+ ≈ 100%",
+      x = "Year",
+      y = "Cumulative Carbon (kg CO2)"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 16, face = "bold"))
+
+  print(yearly_plot)
+}
 ```
 
-## 5. Output Generation
+## 6. Export
 
-### Save Processed Data as CSV
+```{r save-outputs}
+if (!dir.exists("output")) dir.create("output")
 
-```{r save-csv}
-# Create output directory if it doesn't exist
-if (!dir.exists("output")) {
-  dir.create("output")
-}
-
-# Save processed land data
 output_csv <- "output/processed_forest_data.csv"
 write.csv(land_data, output_csv, row.names = FALSE)
+cat(paste("Processed data saved to:", output_csv, "\n"))
 
-cat(paste("✅ Processed data saved to:", output_csv, "\n\n"))
-```
-
-### Generate JSON Output (Web App Compatible)
-
-```{r generate-json}
-# Create JSON structure matching web app format
 timestamp <- format(Sys.time(), "%Y-%m-%dT%H:%M:%S.000Z")
 
-# Calculate additional metrics
-water_retention <- 94  # Default value, could be calculated from environmental data
-air_quality_improvement <- 95  # Default value, could be calculated from environmental data
-annual_carbon <- total_carbon / simulation_years
-
-# Create the JSON structure
+# Web-app-compatible JSON (matches ExportData shape)
 json_output <- list(
   metadata = list(
     timestamp = timestamp,
     simulatorVersion = "1.0.0",
     location = list(
-      latitude = location_data$latitude,
-      longitude = location_data$longitude,
+      latitude = latitude,
+      longitude = longitude,
       type = "Point"
     ),
     simulation = list(
@@ -413,133 +661,59 @@ json_output <- list(
   ),
   environmentalData = list(
     soil = list(
-      carbon = env_data_structured$soil_carbon,
-      pH = env_data_structured$soil_ph
+      carbon = if (is.na(soil_carbon)) NULL else soil_carbon,
+      pH = if (is.na(soil_ph)) NULL else soil_ph
     ),
     climate = list(
-      temperature = env_data_structured$temperature,
-      precipitation = env_data_structured$precipitation
+      temperature = if (is.na(temperature)) NULL else temperature,
+      precipitation = if (is.na(precipitation)) NULL else precipitation
     )
   ),
   impactResults = list(
-    carbonSequestration = ifelse(mode == "planting", annual_carbon, -annual_carbon),
-    biodiversityImpact = average_biodiversity,
-    forestResilience = average_resilience,
+    carbonSequestration = annual_carbon,
+    biodiversityImpact = biodiversity,
+    forestResilience = resilience,
     waterRetention = water_retention,
-    airQualityImprovement = air_quality_improvement,
+    airQualityImprovement = air_quality,
     totalCarbon = total_carbon,
     averageBiodiversity = average_biodiversity,
     averageResilience = average_resilience
   ),
   plantingData = list(
-    area = total_area,
+    area = area_ha,
     totalTrees = total_trees,
-    spacing = 4,
-    density = 625,
+    spacing = spacing,
+    density = density,
     timeline = simulation_years,
     plots = land_data
   )
 )
 
-# Save JSON file
 output_json <- "output/forest_impact_results.json"
-write_json(json_output, output_json, pretty = TRUE, auto_unbox = TRUE)
+write_json(json_output, output_json, pretty = TRUE, auto_unbox = TRUE, null = "null")
+cat(paste("JSON results saved to:", output_json, "\n\n"))
 
-cat(paste("✅ JSON results saved to:", output_json, "\n\n"))
-
-# Display summary
 cat("## Final Summary\n\n")
-cat("**Simulation Results:**\n")
-cat(paste("- Mode:", toupper(mode), "\n"))
-cat(paste("- Total", impact_type, ":", round(total_carbon, 2), "kg CO2\n"))
-cat(paste("- Annual", impact_type, ":", round(annual_carbon, 2), "kg CO2/year\n"))
-cat(paste("- Simulation Period:", simulation_years, "years\n"))
-cat(paste("- Number of Plots:", nrow(land_data), "\n"))
-cat(paste("- Total Area:", round(total_area, 3), "hectares\n"))
-cat(paste("- Average Biodiversity:", round(average_biodiversity, 2), "/5\n"))
-cat(paste("- Average Resilience:", round(average_resilience, 2), "/5\n"))
-```
-
-## 6. Additional Analysis (Optional)
-
-### Yearly Carbon Accumulation Projection
-
-```{r yearly-projection, fig.width=12, fig.height=6, eval=FALSE}
-# Optional: Create yearly carbon accumulation projection
-if (simulation_years > 1 && mode == "planting") {
-  yearly_data <- expand.grid(
-    year = 1:simulation_years,
-    land_id = land_data$land_id,
-    tree_type = land_data$tree_type
-  ) %>%
-    left_join(land_data, by = c("land_id", "tree_type")) %>%
-    mutate(
-      # Assume linear growth for simplicity (could be more complex)
-      cumulative_carbon = (area_ha * carbon_per_ha * year) / simulation_years
-    )
-  
-  yearly_plot <- ggplot(yearly_data, aes(x = year, y = cumulative_carbon, color = tree_type)) +
-    geom_line(size = 1.2) +
-    geom_point(size = 2) +
-    labs(
-      title = "Cumulative Carbon Sequestration Over Time",
-      x = "Year",
-      y = "Cumulative Carbon (kg CO2)",
-      color = "Tree Type"
-    ) +
-    theme_minimal() +
-    theme(
-      plot.title = element_text(size = 16, face = "bold"),
-      legend.position = "bottom"
-    ) +
-    scale_color_brewer(type = "qual", palette = "Set2")
-  
-  print(yearly_plot)
-}
+cat(sprintf("- Mode: %s\n", toupper(mode)))
+cat(sprintf("- Total %s: %s kg CO2\n", impact_type, format(round(total_carbon, 1), big.mark = ",")))
+cat(sprintf("- Years: %s | Area: %s ha | Trees: %s\n",
+            simulation_years, round(area_ha, 2), format(total_trees, big.mark = ",")))
 ```
 
 ---
 
-## Instructions for Use
+## Instructions
 
-1. **Data Input**: The notebook automatically detects and supports multiple formats:
-   - **Standard CSV** (Recommended): Simple table format in `sample-forest-data-standard.csv`
-   - **Structured CSV**: Complex format from web app in `sample-forest-planting-data.csv`
-   - **Manual Input**: Modify the manual input section with your data
-
-2. **Mode Selection**: Change the `mode` variable to either "planting" or "clear-cutting" based on your simulation needs.
-
-3. **Run Analysis**: Execute all code chunks sequentially to perform calculations and generate visualizations.
-
-4. **Output Files**: Check the `output/` directory for:
-   - `processed_forest_data.csv`: Processed data in CSV format
-   - `forest_impact_results.json`: Results in JSON format compatible with the web app
-
-5. **CSV Formats Supported**:
-   
-   **Standard CSV Format** (Easy to use):
-   ```csv
-   land_id,area_ha,tree_type,scientific_name,carbon_per_ha,biodiversity_score,resilience_score,latitude,longitude,simulation_years,soil_carbon,soil_ph,temperature,precipitation
-   Plot_001,0.20,Oak,Quercus robur,22,4.5,4.5,50.56956736416948,28.159344338632376,50,,,22.4,
-   ```
-   
-   **Structured CSV Format** (From web app):
-   - **METADATA**: Timestamp, simulator version, simulation years, location coordinates
-   - **SELECTED TREES**: Tree name, scientific name, carbon sequestration rate, percentage
-   - **ENVIRONMENTAL DATA**: Soil carbon, pH, temperature, precipitation
-   - **IMPACT RESULTS**: Annual carbon sequestration, total carbon, biodiversity, resilience
-   - **PLANTING DATA**: Area, total trees, spacing, density
-
-6. **Customization**: Modify the environmental metrics, tree types, or calculation methods as needed for your specific use case.
+1. **CSV from web app**: Export CSV on the live site and save as `sample-forest-planting-data.csv` (or replace the included sample).
+2. **Mode**: Set `mode` to `"planting"` or `"clear-cutting"`; set `tree_age` for clear-cutting.
+3. **Run** all chunks in RStudio; outputs land in `output/`.
+4. **Growth curve**: Planting carbon uses the documented year-by-year factors (5% → 100%), not linear `rate × years`.
 
 ## Notes
 
-- Carbon calculations assume linear accumulation over the simulation period
-- Biodiversity and resilience scores are on a 1-5 scale
-- Water retention and air quality improvement are set to default values (can be customized)
-- The JSON output structure matches the Forest Impact Simulator web app format
-- All calculations are based on the input data and selected simulation mode
+- Web app CSV columns match `src/utils/exportUtils.ts` in the TypeScript repo.
+- Tree carbon rates are **kg CO₂/year per mature tree**, scaled by tree count — not per hectare.
+- Clear-cutting totals = lifetime stored carbon + lost future sequestration.
+- Constants mirror [Forest-Impact-Simulator](https://github.com/karimogit/Forest-Impact-Simulator) `src/utils/constants.ts`.
 
----
-
-*Generated by Forest Impact Simulator R Notebook - Version 1.0.0*
+*Forest Impact Simulator R Notebook — aligned with web app v1.0.0*

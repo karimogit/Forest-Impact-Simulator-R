@@ -1,0 +1,20 @@
+# R / RStudio
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+
+# Knitr / notebook output
+output/
+*_cache/
+*_files/
+*.html
+*.md
+!README.md
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

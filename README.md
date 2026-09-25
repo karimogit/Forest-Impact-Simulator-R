@@ -1,93 +1,100 @@
 # Forest Impact Simulator - R Version
 
-R notebook to simulate the impact of forest management
+R Markdown companion to the [Forest Impact Simulator](https://forest-impact-simulator.vercel.app/) web app.
 
 ## About
 
-A comprehensive R Markdown notebook for simulating forest carbon impacts, biodiversity effects, and environmental outcomes of forest planting and clear-cutting activities.
+Simulates forest carbon impacts, biodiversity, resilience, water retention, and air quality for planting and clear-cutting — using the **same growth curves and modifiers** as the TypeScript web app.
 
 ## Features
 
-- **Planting Mode**: Calculate positive carbon sequestration from new forest growth
-- **Clear-cutting Mode**: Calculate carbon loss from forest removal
-- **CSV File Upload**: Support for structured forest data files
-- **Manual Input**: Fallback option for custom data entry
-- **Visualizations**: Bar charts, pie charts, and environmental metrics
-- **Multiple Outputs**: CSV and JSON export formats
+- **Planting mode**: Cumulative carbon with realistic year-by-year growth factors (5% → 100% of mature rate)
+- **Clear-cutting mode**: Immediate release (lifetime stored carbon) + lost future sequestration
+- **Web app CSV import**: Reads the single-row export from the live site
+- **Plot CSV / manual input**: Per-plot analysis when not using a web export
+- **Visualizations**: CO₂ bars, environmental metrics, growth-curve projection
+- **Exports**: Processed CSV + web-app-compatible JSON
 
 ## Quick Start
 
-1. Install required R packages:
+1. Install packages:
 ```r
 install.packages(c("tidyverse", "ggplot2", "jsonlite", "readr", "dplyr", "plotly"))
 ```
 
-2. **Get CSV Data** (Optional): Visit [Forest Impact Simulator Web App](https://forest-impact-simulator.vercel.app/) to run a simulation and download CSV data, or use the included sample data
+2. Optional: run a simulation on the [web app](https://forest-impact-simulator.vercel.app/) and download CSV, or use the included `sample-forest-planting-data.csv`.
 
-3. Open `forest-impact-simulator.Rmd` in RStudio
+3. Open `forest-impact-simulator.Rmd` in RStudio and run all chunks.
 
-4. Run all code chunks to perform the analysis
+4. Check `output/` for CSV and JSON results.
 
-5. Check the `output/` directory for generated files
+## Data Formats
 
-## Data Format
+### Web app CSV (recommended)
 
-The notebook automatically detects and supports **three input formats**:
+Single header + one data row — produced by **Export → CSV** in the web app. Columns include:
 
-### Standard CSV Format (Recommended - Easy to Use)
-Simple table format that R can read directly:
-```csv
-land_id,area_ha,tree_type,scientific_name,carbon_per_ha,biodiversity_score,resilience_score,latitude,longitude,simulation_years,soil_carbon,soil_ph,temperature,precipitation
-Plot_001,0.20,Oak,Quercus robur,22,4.5,4.5,50.56956736416948,28.159344338632376,50,,,22.4,
+```
+timestamp, simulator_version, simulation_years, latitude, longitude,
+region_north, region_south, region_east, region_west,
+soil_carbon_g_kg, soil_ph, soil_texture, temperature_c, precipitation_mm,
+annual_carbon_sequestration_kg_co2_year, total_carbon_kg_co2,
+biodiversity_impact, forest_resilience, water_retention_percent,
+air_quality_improvement_percent, average_biodiversity, average_resilience,
+area_hectares, total_trees, spacing_meters, density_trees_hectare,
+years_to_complete, trees_per_season,
+tree_names, tree_scientific_names, tree_carbon_rates_kg_co2_year, tree_percentages
 ```
 
-### Structured CSV Format (From Web App)
-Complex format with multiple sections:
-- **METADATA**: Timestamp, simulator version, simulation years, location coordinates
-- **SELECTED TREES**: Tree name, scientific name, carbon sequestration rate, percentage
-- **ENVIRONMENTAL DATA**: Soil carbon, pH, temperature, precipitation
-- **IMPACT RESULTS**: Annual carbon sequestration, total carbon, biodiversity, resilience
-- **PLANTING DATA**: Area, total trees, spacing, density
+Multiple species are semicolon-separated in the tree columns (e.g. `Oak;Pine`).
 
-**💡 Get CSV Format**: You can generate the structured CSV format by running a simulation on the [Forest Impact Simulator Web App](https://forest-impact-simulator.vercel.app/) and downloading the results.
+See also [`doc/examples/csv_usage_examples.md`](https://github.com/karimogit/Forest-Impact-Simulator/blob/main/doc/examples/csv_usage_examples.md) in the TypeScript repo.
 
-### Manual Input Format
-If no CSV file is available, use manual input with these columns:
-- `land_id`: Unique identifier for each land plot
-- `area_ha`: Area in hectares
-- `tree_type`: Type of trees/species
-- `carbon_per_ha`: Carbon sequestration rate per hectare
+### Plot CSV (optional)
 
-Optional columns:
-- `biodiversity_score`: Biodiversity impact score (1-5 scale)
-- `resilience_score`: Forest resilience score (1-5 scale)
+One row per plot:
+
+| Column | Required | Description |
+|--------|----------|-------------|
+| `land_id` / `plot_id` | Yes | Plot identifier |
+| `area_ha` | Yes | Area in hectares |
+| `tree_type` | Yes | Species name |
+| `carbon_per_tree` | Yes | Mature kg CO₂/year **per tree** |
+| `trees_per_ha` | No | Default 625 |
+| `biodiversity_score` | No | 0–5 scale |
+| `resilience_score` | No | 0–5 scale |
+| `latitude`, `longitude`, `simulation_years` | No | Shared across rows |
+| `soil_carbon`, `temperature`, `precipitation` | No | Environmental inputs |
+
+Save as `sample-forest-plot-data.csv` or replace the sample file.
+
+### Manual input
+
+Edit the `manual_land_data` / `manual_location` frames in the notebook when no CSV is present.
+
+## Calculations (aligned with web app)
+
+**Planting growth factors:** Year 1: 5%, 2: 15%, 3: 30%, 4: 50%, 5: 70%, 6–10: 80%, 11–20: 90%, 20+: 100%.
+
+**Clear-cutting:** Sum of age-based sequestration from year 1…`tree_age` (immediate release) plus lost future sequestration over the simulation period.
+
+**Soil modifier:** `+ soil_carbon_g_kg × 0.1` kg CO₂/year per tree-equivalent rate.
+
+**Comparisons:** Car (~4,600 kg CO₂/year), NY–London flight (~986 kg), US household electricity (~7,500 kg/year).
 
 ## Usage
 
 ```r
-# Set simulation mode
-mode <- "planting"  # or "clear-cutting"
-
-# Configure location and years
-location_data <- data.frame(
-  latitude = 50.56956736416948,
-  longitude = 28.159344338632376,
-  simulation_years = 50
-)
+mode <- "planting"   # or "clear-cutting"
+tree_age <- 20       # clear-cutting only
 ```
-
-## Output
-
-The notebook generates:
-- **CSV file**: Processed forest data
-- **JSON file**: Web app compatible format
-- **Visualizations**: Charts showing CO₂ impact and environmental metrics
 
 ## Related Projects
 
-- **Python Version**: [Forest-Impact-Simulator-Python](https://github.com/KarimOsmanGH/Forest-Impact-Simulator-Python)
-- **TypeScript Version**: [Forest-Impact-Simulator](https://github.com/karimosmanGH/Forest-Impact-Simulator)
+- **TypeScript / Web**: [Forest-Impact-Simulator](https://github.com/karimogit/Forest-Impact-Simulator)
+- **Python**: [Forest-Impact-Simulator-Python](https://github.com/karimogit/Forest-Impact-Simulator-Python)
+- **Live app**: [forest-impact-simulator.vercel.app](https://forest-impact-simulator.vercel.app/)
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT — see [LICENSE](LICENSE).
